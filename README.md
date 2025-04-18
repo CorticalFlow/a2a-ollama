@@ -16,7 +16,9 @@ lab-a2a-ollama-2/
 │   └── client.py           # A2A client implementation
 ├── examples/               # Example implementations
 │   ├── simple_chat/        # Basic agent chat example
-│   └── multi_agent/        # Multiple agents working together
+│   ├── multi_agent/        # Multiple agents working together
+│   ├── sse_streaming/      # Real-time streaming with Server-Sent Events
+│   └── webhook_notifications/ # Proactive task status updates via webhooks
 └── requirements.txt        # Project dependencies
 ```
 
@@ -72,6 +74,28 @@ python chat_with_agent.py --message "What is the capital of France?"
 cd examples/multi_agent
 python orchestrator.py --topic "renewable energy"
 ```
+
+### SSE Streaming Example
+
+```bash
+cd examples/sse_streaming
+python sse_server.py --port 8000
+# In another terminal window
+python sse_client.py --endpoint http://localhost:8000 --query "Explain quantum computing" --visualize
+```
+
+The SSE streaming example demonstrates how to implement real-time streaming of agent responses using Server-Sent Events. This provides immediate feedback to users as responses are generated, improving the perceived performance and user experience.
+
+### Webhook Notifications Example
+
+```bash
+cd examples/webhook_notifications
+python webhook_server.py --a2a-port 8000 --webhook-port 8001
+# In another terminal window
+python webhook_client.py --a2a-endpoint http://localhost:8000 --webhook-base http://localhost:8001
+```
+
+The webhook notifications example shows how to implement proactive task status updates, allowing agents to notify clients when important events occur without requiring polling. This is ideal for asynchronous operations and long-running tasks.
 
 ## License
 
