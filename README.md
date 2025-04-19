@@ -1,5 +1,8 @@
 # Google's Agent2Agent (A2A) Protocol: Ollama Implementation
 
+Medium Article:
+https://medium.com/@CorticalFlow/googles-agent2agent-a2a-protocol-implementation-with-ollama-integration-27f1c9f2d4d3
+
 This repository demonstrates an implementation of Google's Agent2Agent (A2A) protocol integrated with Ollama for local LLM inference.
 
 ## Project Structure
