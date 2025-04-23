@@ -2,4 +2,10 @@ ollama==0.4.8
 requests==2.32.3
 Flask==2.3.3
 python-dotenv==1.0.0
-sseclient-py==1.7.2 
+sseclient-py==1.7.2
+# MCP-specific requirements
+fastapi==0.108.0
+uvicorn==0.24.0
+python-multipart==0.0.6
+pydantic
+aiohttp==3.9.1

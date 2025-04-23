@@ -95,4 +95,43 @@ class AgentCard:
             A new AgentCard instance
         """
         data = json.loads(json_str)
-        return cls.from_dict(data) 
+        return cls.from_dict(data)
+        
+    def add_mcp_capabilities(self, mcp_tools: List[Dict[str, Any]]) -> None:
+        """
+        Add MCP tools to agent capabilities.
+        
+        Args:
+            mcp_tools: List of MCP tool definitions
+        """
+        for tool in mcp_tools:
+            # Convert MCP tool parameters to A2A skill parameters
+            parameters = []
+            if "parameters" in tool:
+                tool_params = tool["parameters"].get("properties", {})
+                required_params = tool["parameters"].get("required", [])
+                
+                for param_name, param_details in tool_params.items():
+                    parameters.append({
+                        "name": param_name,
+                        "description": param_details.get("description", ""),
+                        "type": param_details.get("type", "string"),
+                        "required": param_name in required_params
+                    })
+            
+            # Add MCP tool as an A2A skill
+            self.skills.append({
+                "name": tool["name"],
+                "description": tool["description"],
+                "protocol": "mcp",
+                "parameters": parameters
+            })
+    
+    def get_mcp_skills(self) -> List[Dict[str, Any]]:
+        """
+        Get all skills that use the MCP protocol.
+        
+        Returns:
+            List of MCP-based skills
+        """
+        return [skill for skill in self.skills if skill.get("protocol") == "mcp"] 

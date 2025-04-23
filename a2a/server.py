@@ -8,6 +8,7 @@ import json
 import os
 import time
 import requests
+import threading
 from flask import Flask, request, jsonify, Response, stream_with_context
 from typing import Dict, Any, List, Optional, Callable
 
@@ -45,6 +46,8 @@ class A2AServer:
         """
         self.port = port
         self.webhook_url = webhook_url
+        self.server_thread = None
+        self.should_stop = False
         
         if endpoint is None:
             endpoint = f"http://localhost:{port}"
@@ -241,10 +244,33 @@ class A2AServer:
             response = self.a2a_ollama.process_request(request_data)
             return jsonify(response)
     
-    def run(self):
-        """Run the A2A server."""
+    def _run_server(self):
+        """Internal method to run the Flask server."""
         print(f"Starting A2A server on port {self.port}...")
-        self.app.run(host="0.0.0.0", port=self.port)
+        self.app.run(host="0.0.0.0", port=self.port, threaded=True)
+    
+    def run(self):
+        """Run the A2A server synchronously."""
+        self._run_server()
+        
+    async def start(self):
+        """Start the A2A server asynchronously."""
+        self.server_thread = threading.Thread(target=self._run_server)
+        self.server_thread.daemon = True
+        self.server_thread.start()
+        # Give the server a moment to start
+        import asyncio
+        await asyncio.sleep(0.5)
+        
+    async def stop(self):
+        """Stop the A2A server asynchronously."""
+        # Currently there's no clean way to stop Flask in a thread
+        # This is a placeholder for proper shutdown logic
+        self.should_stop = True
+        # Just log for now
+        print("A2A server stopping - note that the server thread may continue running until process exit")
+        import asyncio
+        await asyncio.sleep(0.1)
 
 
 def run_server(

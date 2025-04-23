@@ -19,7 +19,17 @@ class TaskManager:
     def __init__(self):
         """Initialize the Task Manager."""
         self.tasks = {}
+        self.mcp_bridge = None
     
+    def enable_mcp(self, mcp_bridge: Any) -> None:
+        """
+        Enable MCP integration with provided bridge.
+        
+        Args:
+            mcp_bridge: The A2A-MCP bridge
+        """
+        self.mcp_bridge = mcp_bridge
+        
     def create_task(self, params: Dict[str, Any]) -> str:
         """
         Create a new task.
@@ -91,4 +101,53 @@ class TaskManager:
         if status:
             return [task for task in self.tasks.values() if task["status"] == status]
         else:
-            return list(self.tasks.values()) 
+            return list(self.tasks.values())
+            
+    async def process_task(self, task_id: str) -> Dict[str, Any]:
+        """
+        Process a task, using MCP if appropriate.
+        
+        Args:
+            task_id: The ID of the task
+            
+        Returns:
+            Result of processing the task
+        """
+        task = self.get_task(task_id)
+        
+        if not task:
+            return {"error": f"Task not found: {task_id}"}
+            
+        # If MCP is enabled and this task might be an MCP task
+        if self.mcp_bridge and self._can_use_mcp_for_task(task):
+            try:
+                return await self.mcp_bridge.process_a2a_task_with_mcp(task)
+            except Exception as e:
+                # If MCP processing fails, log the error
+                print(f"Error processing task with MCP: {e}")
+                # Don't return yet - fall back to normal processing
+        
+        # If we got here, either MCP is not enabled, task is not an MCP task,
+        # or MCP processing failed
+        return {"status": "submitted", "message": "Task ready for normal processing"}
+    
+    def _can_use_mcp_for_task(self, task: Dict[str, Any]) -> bool:
+        """
+        Check if a task can be handled by MCP.
+        
+        Args:
+            task: The task to check
+            
+        Returns:
+            True if the task can be handled by MCP
+        """
+        if not self.mcp_bridge:
+            return False
+            
+        # Check if the task specifies an MCP skill
+        skill_name = task.get("params", {}).get("skill")
+        if not skill_name:
+            return False
+            
+        # Check if this skill is in our MCP-to-A2A mapping
+        return skill_name in self.mcp_bridge.mcp_to_a2a_map 

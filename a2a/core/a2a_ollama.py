@@ -15,6 +15,7 @@ from ollama import Client
 from a2a.core.agent_card import AgentCard
 from a2a.core.task_manager import TaskManager
 from a2a.core.message_handler import MessageHandler
+from a2a.core.mcp.mcp_client import MCPClient
 
 
 class A2AOllama:
@@ -55,6 +56,16 @@ class A2AOllama:
         )
         self.task_manager = TaskManager()
         self.message_handler = MessageHandler()
+        self.mcp_client = None
+    
+    def configure_mcp_client(self, mcp_client: MCPClient) -> None:
+        """
+        Configure MCP client for tool access.
+        
+        Args:
+            mcp_client: The MCP client
+        """
+        self.mcp_client = mcp_client
     
     def process_request(self, request: Dict[str, Any]) -> Dict[str, Any]:
         """
@@ -130,230 +141,410 @@ class A2AOllama:
         if not task:
             return {"error": f"Task not found: {task_id}"}
         
+        # Check if this is an MCP task
+        if self.task_manager.mcp_bridge and self.task_manager._can_use_mcp_for_task(task):
+            try:
+                import asyncio
+                return asyncio.run(self.task_manager.process_task(task_id))
+            except Exception as e:
+                print(f"Error processing MCP task: {e}")
+                # Fall back to normal processing
+        
         ollama_messages = self._get_ollama_messages(task_id)
         
         # Set up retry parameters
         max_retries = 3
+        retry_count = 0
+        last_error = None
         
-        for retry in range(max_retries + 1):
+        while retry_count < max_retries:
             try:
-                # First, check if the model is actually loaded
-                try:
-                    models_response = self.client._request("GET", "api/tags")
-                    available_models = [m["name"] for m in models_response.get("models", [])]
-                    
-                    if self.model not in available_models:
-                        fallback_msg = f"Model {self.model} not available. Available models: {available_models}"
-                        print(fallback_msg)
-                        
-                        # Try to use an alternative model if available
-                        for fallback in ["llama2", "gemma:2b", "mistral"]:
-                            if fallback in available_models:
-                                print(f"Falling back to model: {fallback}")
-                                self.model = fallback
-                                break
-                except Exception as e:
-                    print(f"Warning: Could not check available models: {e}")
+                # Add available MCP tools to the system message if MCP is configured
+                if self.mcp_client and self.mcp_client.available_tools:
+                    # Check if we have a system message, if not add one
+                    has_system_message = False
+                    for msg in ollama_messages:
+                        if msg.get("role") == "system":
+                            has_system_message = True
+                            # Add MCP tools to existing system message
+                            msg["content"] += self._get_mcp_tools_description()
+                            break
+                            
+                    if not has_system_message:
+                        # Create a new system message with MCP tools
+                        ollama_messages.insert(0, {
+                            "role": "system",
+                            "content": f"You are {self.agent_card.name}, {self.agent_card.description}. {self._get_mcp_tools_description()}"
+                        })
                 
-                print(f"Using model: {self.model} for task processing")
-                
-                # Make the actual API call
+                # Generate a response using Ollama
                 response = self.client.chat(
                     model=self.model,
                     messages=ollama_messages
                 )
                 
-                # Create A2A message from Ollama response
+                # Check for MCP tool calls in the response
+                response_content = response.get("message", {}).get("content", "")
+                tool_calls = self._extract_tool_calls(response_content)
+                
+                if tool_calls and self.mcp_client:
+                    # Execute the tool calls and append results
+                    tool_results = []
+                    for tool_call in tool_calls:
+                        tool_name = tool_call.get("name")
+                        parameters = tool_call.get("parameters", {})
+                        
+                        try:
+                            import asyncio
+                            result = asyncio.run(self.mcp_client.execute_tool(tool_name, parameters))
+                            tool_results.append({
+                                "name": tool_name,
+                                "result": result.result,
+                                "error": result.error
+                            })
+                        except Exception as e:
+                            tool_results.append({
+                                "name": tool_name,
+                                "result": None,
+                                "error": str(e)
+                            })
+                    
+                    # Add the tool results to the messages
+                    ollama_messages.append({
+                        "role": "assistant",
+                        "content": response_content
+                    })
+                    
+                    # Add tool results message
+                    ollama_messages.append({
+                        "role": "system",
+                        "content": f"Tool results: {json.dumps(tool_results)}"
+                    })
+                    
+                    # Generate a final response that incorporates the tool results
+                    final_response = self.client.chat(
+                        model=self.model,
+                        messages=ollama_messages
+                    )
+                    
+                    response = final_response
+                
+                # Update task status
+                self.task_manager.update_task_status(task_id, "completed")
+                
+                # Create A2A message from the response
+                message_id = str(uuid.uuid4())
                 a2a_message = {
-                    "id": str(uuid.uuid4()),
+                    "id": message_id,
                     "role": "agent",
                     "parts": [
                         {
                             "type": "text",
-                            "content": response["message"]["content"] if "message" in response and "content" in response["message"] else "No content received from model"
+                            "content": response.get("message", {}).get("content", "")
                         }
                     ]
                 }
                 
+                # Add the message to the task
                 self.message_handler.add_message(task_id, a2a_message)
-                self.task_manager.update_task_status(task_id, "completed")
                 
                 return {
                     "task_id": task_id,
+                    "message_id": message_id,
                     "status": "completed",
                     "message": a2a_message
                 }
                 
             except Exception as e:
-                error_message = f"Error processing task (attempt {retry+1}/{max_retries+1}): {str(e)}"
-                print(error_message)
-                
-                if retry < max_retries:
-                    # Wait before retrying
-                    time.sleep(1)
-                    continue
-                
-                # Generate a fallback response after all retries fail
-                fallback_message = {
-                    "id": str(uuid.uuid4()),
-                    "role": "agent",
-                    "parts": [
-                        {
-                            "type": "text",
-                            "content": (
-                                "I apologize, but I encountered an error while processing your request. "
-                                "This could be due to issues with the Ollama service or model configuration. "
-                                f"Error details: {str(e)}"
-                            )
-                        }
-                    ]
-                }
-                
-                self.message_handler.add_message(task_id, fallback_message)
-                self.task_manager.update_task_status(task_id, "failed")
-                
-                return {
-                    "task_id": task_id,
-                    "status": "failed",
-                    "error": str(e),
-                    "message": fallback_message
-                }
+                last_error = str(e)
+                retry_count += 1
+                print(f"Error processing task (attempt {retry_count}): {e}")
+                time.sleep(1)  # Wait before retrying
+        
+        # If we get here, all retries failed
+        self.task_manager.update_task_status(task_id, "failed")
+        
+        return {
+            "task_id": task_id,
+            "status": "failed",
+            "error": last_error
+        }
     
+    def _extract_tool_calls(self, content: str) -> List[Dict[str, Any]]:
+        """
+        Extract MCP tool calls from an Ollama response.
+        
+        Args:
+            content: The response content
+            
+        Returns:
+            List of extracted tool calls
+        """
+        tool_calls = []
+        
+        # Simple parsing for tool calls - in reality this would need to be more robust
+        # Example format to detect: {"name": "tool_name", "parameters": {"param1": "value1"}}
+        import re
+        
+        # Look for JSON objects that might be tool calls
+        json_pattern = r'\{\s*"name"\s*:\s*"([^"]*)"\s*,\s*"parameters"\s*:\s*(\{[^}]*\})\s*\}'
+        matches = re.finditer(json_pattern, content)
+        
+        for match in matches:
+            try:
+                tool_name = match.group(1)
+                parameters_str = match.group(2)
+                parameters = json.loads(parameters_str)
+                
+                tool_calls.append({
+                    "name": tool_name,
+                    "parameters": parameters
+                })
+            except Exception as e:
+                print(f"Error parsing tool call: {e}")
+        
+        return tool_calls
+        
+    def _get_mcp_tools_description(self) -> str:
+        """
+        Get a description of available MCP tools.
+        
+        Returns:
+            Description of MCP tools
+        """
+        if not self.mcp_client or not self.mcp_client.available_tools:
+            return ""
+            
+        tools_description = "You have access to the following tools:\n\n"
+        
+        for name, tool in self.mcp_client.available_tools.items():
+            tools_description += f"- {name}: {tool.description}\n"
+            
+            if tool.parameters:
+                tools_description += "  Parameters:\n"
+                for param in tool.parameters:
+                    required = " (required)" if param.required else ""
+                    tools_description += f"  - {param.name}{required}: {param.description}\n"
+                    
+            tools_description += "\n"
+            
+        tools_description += "\nTo use a tool, respond with JSON in this format: {\"name\": \"tool_name\", \"parameters\": {\"param1\": \"value1\"}}\n"
+        
+        return tools_description
+        
     def _process_task_stream(self, task_id: str) -> Iterator[Dict[str, Any]]:
         """
-        Process a task using Ollama with streaming response.
+        Process a task using Ollama with streaming.
         
         Args:
             task_id: The ID of the task to process
             
-        Yields:
-            Chunks of the response as they become available
+        Returns:
+            Iterator of streaming chunks
         """
         task = self.task_manager.get_task(task_id)
         
         if not task:
-            yield {"error": f"Task not found: {task_id}"}
+            yield {
+                "task_id": task_id,
+                "error": f"Task not found: {task_id}",
+                "done": True
+            }
+            return
+            
+        # If this is an MCP task, we don't support streaming yet
+        if self.task_manager.mcp_bridge and self.task_manager._can_use_mcp_for_task(task):
+            yield {
+                "task_id": task_id,
+                "error": "Streaming not supported for MCP tasks",
+                "done": True
+            }
             return
         
         ollama_messages = self._get_ollama_messages(task_id)
         
-        # Initialize variables to store the full response
+        # Update task status
+        self.task_manager.update_task_status(task_id, "working")
+        
+        # Generate a message ID
         message_id = str(uuid.uuid4())
+        
+        # Initialize content buffer
         full_content = ""
         
-        # Set up retry parameters
-        max_retries = 3
-        retry_count = 0
-        
-        while retry_count <= max_retries:
-            try:
-                # First, check if the model is actually loaded
-                try:
-                    models_response = self.client._request("GET", "api/tags")
-                    available_models = [m["name"] for m in models_response.get("models", [])]
+        # Add available MCP tools to the system message if MCP is configured
+        if self.mcp_client and self.mcp_client.available_tools:
+            # Check if we have a system message, if not add one
+            has_system_message = False
+            for msg in ollama_messages:
+                if msg.get("role") == "system":
+                    has_system_message = True
+                    # Add MCP tools to existing system message
+                    msg["content"] += self._get_mcp_tools_description()
+                    break
                     
-                    if self.model not in available_models:
-                        fallback_msg = f"Model {self.model} not available. Available models: {available_models}"
-                        print(fallback_msg)
-                        
-                        # Try to use an alternative model if available
-                        for fallback in ["llama2", "gemma:2b", "mistral"]:
-                            if fallback in available_models:
-                                print(f"Falling back to model: {fallback}")
-                                self.model = fallback
-                                break
-                except Exception as e:
-                    print(f"Warning: Could not check available models: {e}")
-                
-                print(f"Using model: {self.model} for streaming")
-                
-                # Stream the response from Ollama
-                stream_response = self.client.chat(
-                    model=self.model,
-                    messages=ollama_messages,
-                    stream=True
-                )
-                
-                # Make sure it's an iterable
-                if not hasattr(stream_response, '__iter__'):
-                    yield {
-                        "task_id": task_id,
-                        "status": "failed",
-                        "error": "Ollama did not return a streamable response",
-                        "done": True
-                    }
-                    return
-                
-                # Process the stream
-                for chunk in stream_response:
-                    # Extract the new content
-                    if 'message' in chunk and 'content' in chunk['message']:
-                        new_content = chunk['message']['content']
-                        full_content += new_content
-                        
-                        # Create chunk data with partial content
-                        chunk_data = {
-                            "task_id": task_id,
-                            "message_id": message_id,
-                            "chunk": {
-                                "type": "text",
-                                "content": new_content
-                            },
-                            "done": False
-                        }
-                        
-                        yield chunk_data
-                
-                # If we get here, streaming completed successfully
-                break
-                
-            except Exception as e:
-                retry_count += 1
-                error_msg = f"Error during streaming (attempt {retry_count}/{max_retries}): {str(e)}"
-                print(error_msg)
-                
-                if retry_count > max_retries:
-                    # We've exhausted our retries
-                    yield {
-                        "task_id": task_id,
-                        "status": "failed",
-                        "error": error_msg,
-                        "done": True
-                    }
-                    return
-                
-                # Add a small delay before retrying
-                time.sleep(1)
-                
-                # Let the user know we're retrying
-                yield {
-                    "task_id": task_id,
-                    "message_id": message_id,
-                    "chunk": {
-                        "type": "text",
-                        "content": f"\n[Retrying due to error: {str(e)}]\n"
-                    },
-                    "done": False
-                }
+            if not has_system_message:
+                # Create a new system message with MCP tools
+                ollama_messages.insert(0, {
+                    "role": "system",
+                    "content": f"You are {self.agent_card.name}, {self.agent_card.description}. {self._get_mcp_tools_description()}"
+                })
         
-        # If we reached here with no content, add a fallback response
-        if not full_content:
-            fallback_response = (
-                "I apologize, but I was unable to generate a proper response. "
-                "This could be due to issues with the Ollama API or the model configuration. "
-                "Please check that Ollama is running correctly and that the requested model is available."
-            )
-            full_content = fallback_response
+        try:
+            # Stream response from Ollama
+            for chunk in self.client.chat(
+                model=self.model,
+                messages=ollama_messages,
+                stream=True
+            ):
+                content = chunk.get("message", {}).get("content", "")
+                
+                if content:
+                    full_content += content
+                    
+                    # Send chunk
+                    yield {
+                        "task_id": task_id,
+                        "message_id": message_id,
+                        "chunk": {
+                            "type": "text",
+                            "content": content
+                        },
+                        "done": False
+                    }
+        except Exception as e:
+            # Handle error
+            error_message = str(e)
+            self.task_manager.update_task_status(task_id, "failed")
             
+            yield {
+                "task_id": task_id,
+                "message_id": message_id,
+                "error": error_message,
+                "status": "failed",
+                "done": True
+            }
+            return
+        
+        # Check for MCP tool calls in the response
+        tool_calls = self._extract_tool_calls(full_content)
+        
+        if tool_calls and self.mcp_client:
+            # Execute the tool calls and append results
             yield {
                 "task_id": task_id,
                 "message_id": message_id,
                 "chunk": {
                     "type": "text",
-                    "content": fallback_response
+                    "content": "\n\nExecuting tool calls..."
                 },
                 "done": False
             }
+            
+            tool_results = []
+            for tool_call in tool_calls:
+                tool_name = tool_call.get("name")
+                parameters = tool_call.get("parameters", {})
+                
+                try:
+                    import asyncio
+                    result = asyncio.run(self.mcp_client.execute_tool(tool_name, parameters))
+                    tool_results.append({
+                        "name": tool_name,
+                        "result": result.result,
+                        "error": result.error
+                    })
+                    
+                    # Send a chunk with the tool result
+                    yield {
+                        "task_id": task_id,
+                        "message_id": message_id,
+                        "chunk": {
+                            "type": "text",
+                            "content": f"\nTool '{tool_name}' result: {json.dumps(result.result)}"
+                        },
+                        "done": False
+                    }
+                except Exception as e:
+                    error_msg = str(e)
+                    tool_results.append({
+                        "name": tool_name,
+                        "result": None,
+                        "error": error_msg
+                    })
+                    
+                    # Send a chunk with the tool error
+                    yield {
+                        "task_id": task_id,
+                        "message_id": message_id,
+                        "chunk": {
+                            "type": "text",
+                            "content": f"\nTool '{tool_name}' error: {error_msg}"
+                        },
+                        "done": False
+                    }
+            
+            # Add the tool results to the messages
+            ollama_messages.append({
+                "role": "assistant",
+                "content": full_content
+            })
+            
+            # Add tool results message
+            ollama_messages.append({
+                "role": "system",
+                "content": f"Tool results: {json.dumps(tool_results)}"
+            })
+            
+            # Generate a final response that incorporates the tool results
+            yield {
+                "task_id": task_id,
+                "message_id": message_id,
+                "chunk": {
+                    "type": "text",
+                    "content": "\n\nGenerating final response with tool results..."
+                },
+                "done": False
+            }
+            
+            final_content = ""
+            try:
+                # Stream final response
+                for chunk in self.client.chat(
+                    model=self.model,
+                    messages=ollama_messages,
+                    stream=True
+                ):
+                    content = chunk.get("message", {}).get("content", "")
+                    
+                    if content:
+                        final_content += content
+                        
+                        # Send chunk
+                        yield {
+                            "task_id": task_id,
+                            "message_id": message_id,
+                            "chunk": {
+                                "type": "text",
+                                "content": content
+                            },
+                            "done": False
+                        }
+            except Exception as e:
+                # Handle error in final response
+                error_message = str(e)
+                yield {
+                    "task_id": task_id,
+                    "message_id": message_id,
+                    "chunk": {
+                        "type": "text",
+                        "content": f"\n\nError generating final response: {error_message}"
+                    },
+                    "done": False
+                }
+                
+            # Update the full content to include the final response
+            full_content += "\n\n" + final_content
         
         # Create the full A2A message
         a2a_message = {
